@@ -1,0 +1,249 @@
+#"""Healthcare dengue surveillance MCP server"""
+
+import asyncio
+import json
+import os
+from datetime import datetime, timedelta, timezone
+
+import numpy as np
+import pandas as pd
+from mcp import types
+from mcp.server import Server
+from mcp.server.stdio import run_server
+from sklearn.ensemble import IsolationForest
+
+DATA_FILE = os.environ.get("DENGUE_DATA", "dengue_sample.csv")
+
+app = Server("dengue-surveillance")
+
+
+@app.list_tools()
+async def handle_list_tools() -> list[types.Tool]:
+    return [
+        types.Tool(
+            name="get_outbreak_risk",
+            description=(
+                "Calculate outbreak risk score (0-100) for a region. "
+                "Returns risk level (CRITICAL/HIGH/MEDIUM/LOW), trend, anomaly status. "
+                "Use before generating any public health alert."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "region": {"type": "string", "description": "Target region name"},
+                    "days_back": {
+                        "type": "integer",
+                        "description": "Number of days to look back",
+                        "default": 30,
+                        "minimum": 1,
+                    },
+                },
+                "required": ["region"],
+                "additionalProperties": False,
+            },
+        ),
+        types.Tool(
+            name="list_high_risk_facilities",
+            description=(
+                "List facilities with case counts above threshold. "
+                "Call after get_outbreak_risk returns HIGH or CRITICAL."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "region": {"type": "string", "description": "Target region name"},
+                    "threshold": {
+                        "type": "integer",
+                        "description": "Minimum case count threshold",
+                        "default": 10,
+                        "minimum": 0,
+                    },
+                },
+                "required": ["region"],
+                "additionalProperties": False,
+            },
+        ),
+    ]
+
+
+@app.call_tool()
+async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    try:
+        args = arguments or {}
+
+        if name == "get_outbreak_risk":
+            region = str(args.get("region", "")).strip()
+            days_back = int(args.get("days_back", 30))
+
+            if not region:
+                return [types.TextContent(type="text", text=json.dumps({"error": "region is required"}))]
+
+            df = pd.read_csv(DATA_FILE)
+            if "date" not in df.columns or "region" not in df.columns or "cases" not in df.columns:
+                return [
+                    types.TextContent(
+                        type="text",
+                        text=json.dumps({"error": "CSV must include date, region, and cases columns"}),
+                    )
+                ]
+
+            df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
+            df["cases"] = pd.to_numeric(df["cases"], errors="coerce").fillna(0)
+            df = df.dropna(subset=["date"])
+
+            now = datetime.now(timezone.utc)
+            cutoff = now - timedelta(days=days_back)
+
+            region_df = df[df["region"].astype(str).str.lower() == region.lower()].copy()
+            region_df = region_df[region_df["date"] >= cutoff]
+
+            if region_df.empty:
+                payload = {
+                    "region": region,
+                    "risk_score": 0,
+                    "risk_level": "LOW",
+                    "trend": "STABLE",
+                    "cases": 0,
+                    "baseline": 0.0,
+                    "anomaly_detected": False,
+                    "confidence": 0.0,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                return [types.TextContent(type="text", text=json.dumps(payload))]
+
+            weekly = (
+                region_df.set_index("date")["cases"]
+                .resample("W")
+                .sum()
+                .astype(float)
+            )
+
+            if weekly.empty:
+                payload = {
+                    "region": region,
+                    "risk_score": 0,
+                    "risk_level": "LOW",
+                    "trend": "STABLE",
+                    "cases": 0,
+                    "baseline": 0.0,
+                    "anomaly_detected": False,
+                    "confidence": 0.0,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                return [types.TextContent(type="text", text=json.dumps(payload))]
+
+            weeks = len(weekly)
+            current = float(weekly.iloc[-1])
+            prior = float(weekly.iloc[-2]) if weeks >= 2 else current
+            anomaly = False
+
+            if weeks >= 4:
+                model = IsolationForest(contamination=0.1, random_state=42)
+                X = weekly.values.reshape(-1, 1)
+                preds = model.fit_predict(X)
+                anomaly = bool(preds[-1] == -1)
+
+            baseline_values = weekly.iloc[:-1]
+            baseline = float(np.mean(baseline_values)) if len(baseline_values) > 0 else current
+            ratio = current / max(baseline, 1.0)
+            risk_score = min(100, int(ratio * 40 + (50 if anomaly else 0)))
+
+            if risk_score >= 85:
+                risk_level = "CRITICAL"
+            elif risk_score >= 65:
+                risk_level = "HIGH"
+            elif risk_score >= 35:
+                risk_level = "MEDIUM"
+            else:
+                risk_level = "LOW"
+
+            if current > prior:
+                trend = "RISING"
+            elif current < prior:
+                trend = "DECLINING"
+            else:
+                trend = "STABLE"
+
+            payload = {
+                "region": region,
+                "risk_score": risk_score,
+                "risk_level": risk_level,
+                "trend": trend,
+                "cases": int(current),
+                "baseline": baseline,
+                "anomaly_detected": anomaly,
+                "confidence": min(1.0, weeks / 8),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            return [types.TextContent(type="text", text=json.dumps(payload))]
+
+        if name == "list_high_risk_facilities":
+            region = str(args.get("region", "")).strip()
+            threshold = int(args.get("threshold", 10))
+
+            if not region:
+                return [types.TextContent(type="text", text=json.dumps({"error": "region is required"}))]
+
+            df = pd.read_csv(DATA_FILE)
+            required = {"date", "region", "facility_id", "cases"}
+            if not required.issubset(df.columns):
+                return [
+                    types.TextContent(
+                        type="text",
+                        text=json.dumps(
+                            {"error": "CSV must include date, region, facility_id, and cases columns"}
+                        ),
+                    )
+                ]
+
+            df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
+            df["cases"] = pd.to_numeric(df["cases"], errors="coerce").fillna(0)
+            df = df.dropna(subset=["date"])
+
+            now = datetime.now(timezone.utc)
+            cutoff = now - timedelta(days=7)
+
+            region_df = df[df["region"].astype(str).str.lower() == region.lower()].copy()
+            region_df = region_df[region_df["date"] >= cutoff]
+
+            grouped = (
+                region_df.groupby("facility_id", dropna=False)["cases"]
+                .sum()
+                .reset_index()
+                .rename(columns={"facility_id": "facility"})
+            )
+
+            high_risk = grouped[grouped["cases"] > threshold].sort_values("cases", ascending=False)
+            facilities = [
+                {"facility": str(row["facility"]), "cases": int(row["cases"])}
+                for _, row in high_risk.iterrows()
+            ]
+
+            payload = {
+                "region": region,
+                "threshold": threshold,
+                "high_risk_facilities": facilities,
+            }
+            return [types.TextContent(type="text", text=json.dumps(payload))]
+
+        return [types.TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
+
+    except Exception as exc:
+        return [types.TextContent(type="text", text=json.dumps({"error": str(exc)}))]
+
+
+# Start server: python dengue_mcp_server.py
+# claude_desktop_config.json template:
+# {
+#   "mcpServers": {
+#     "dengue-surveillance": {
+#       "command": "python",
+#       "args": ["/absolute/path/to/dengue_mcp_server.py"],
+#       "env": {
+#         "DENGUE_DATA": "/absolute/path/to/dengue_sample.csv"
+#       }
+#     }
+#   }
+# }
+if __name__ == "__main__":
+    asyncio.run(run_server(app))
